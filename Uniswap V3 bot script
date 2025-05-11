@@ -7,8 +7,8 @@ const IUniswapV3PoolABI = require('./abis/IUniswapV3Pool.json');
 const ERC20ABI = require('./abis/ERC20.json');
 
 // YOUR API Keys inserted here
-const INFURA_PROJECT_ID = 'a2c6b51b3f9e4eea8ffda424a8350cc9';
-const GRAPH_API_KEY = '9eee5e0fcfcc1bb445a8b28bb927a014';
+const INFURA_PROJECT_ID = '';
+const GRAPH_API_KEY = '';
 
 const provider = new ethers.JsonRpcProvider(`https://mainnet.infura.io/v3/${INFURA_PROJECT_ID}`);
 
