@@ -1,0 +1,595 @@
+const ethers = require('ethers');
+const fetch = require('node-fetch');
+const Decimal = require('decimal.js'); // Make sure you have this installed: npm install decimal.js
+
+// ABIs (ensure these paths are correct relative to your script)
+const IUniswapV3PoolABI = require('./abis/IUniswapV3Pool.json');
+const ERC20ABI = require('./abis/ERC20.json');
+
+// YOUR API Keys inserted here
+const INFURA_PROJECT_ID = 'a2c6b51b3f9e4eea8ffda424a8350cc9';
+const GRAPH_API_KEY = '9eee5e0fcfcc1bb445a8b28bb927a014';
+
+const provider = new ethers.JsonRpcProvider(`https://mainnet.infura.io/v3/${INFURA_PROJECT_ID}`);
+
+const USDC_ADDRESS = '0xa0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48';
+
+const Q192 = BigInt(2)**BigInt(192); // Pre-calculate 2^192 as BigInt
+const Q192_DECIMAL = new Decimal(Q192.toString()); // Pre-calculate 2^192 as Decimal string
+
+let allPools = new Map();
+let tokenPairMap = new Map();
+
+function formatTokenPair(token0, token1) {
+    return [token0.toLowerCase(), token1.toLowerCase()].sort().join('-');
+}
+
+// Format Decimal price to a human-readable string
+function formatPrice(decimalPrice) {
+    // Keep or remove debug logs as needed
+    // console.log(`DEBUG: Inside formatPrice, input type: ${typeof decimalPrice}, value: ${decimalPrice}`);
+    // Use Decimal.toFixed for precise formatting
+    return decimalPrice.toFixed(10);
+}
+
+// Calculates the price of Token1 per Token0, adjusted for decimals, as a Decimal object
+function getPriceFromSqrtPrice(sqrtPriceX96, token0Decimals, token1Decimals) {
+    // Keep or remove debug logs as needed
+    // console.log(`DEBUG: Inside getPriceFromSqrtPrice, sqrtPriceX96 type: ${typeof sqrtPriceX96}, value: ${sqrtPriceX96}`);
+     try {
+        // Correct conversion from BigInt (sqrtPriceX96) to Decimal
+        const sqrtPriceX96_Decimal = new Decimal(sqrtPriceX96.toString());
+
+        // Ensure decimals are numbers for the power calculation
+        const dec0 = typeof token0Decimals === 'bigint' ? Number(token0Decimals) : token0Decimals;
+        const dec1 = typeof token1Decimals === 'bigint' ? Number(token1Decimals) : token1Decimals;
+
+        // Safeguard just in case conversion failed - although decimals should fit in Number
+        if (typeof dec0 !== 'number' || typeof dec1 !== 'number') {
+             console.error("Error: Decimals are not numbers after conversion attempt.");
+             return new Decimal(0);
+        }
+
+
+        const price_raw = sqrtPriceX96_Decimal.mul(sqrtPriceX96_Decimal).div(Q192_DECIMAL);
+        const decimalAdjustment = new Decimal(10).pow(dec0 - dec1); // Use number decimals here
+        const adjustedPrice = price_raw.mul(decimalAdjustment);
+
+        // Keep or remove debug logs as needed
+        // console.log(`DEBUG: Inside getPriceFromSqrtPrice, returning type: ${typeof adjustedPrice}, value: ${adjustedPrice}`);
+        return adjustedPrice; // Return as Decimal
+    } catch (error) {
+        console.error("Error in getPriceFromSqrtPrice:", error.message || error);
+        return new Decimal(0); // Return 0 as Decimal on error
+    }
+}
+
+
+async function registerPool(poolAddress, immutables) {
+    try {
+        const poolContract = new ethers.Contract(poolAddress, IUniswapV3PoolABI, provider);
+
+        // Keep or remove debug logs as needed
+        // console.log(`DEBUG: Getting state for ${poolAddress}`);
+        const state = await getPoolState(poolContract); // state.sqrtPriceX96 should be BigInt
+        // Keep or remove debug logs as needed
+        // console.log(`DEBUG: state.sqrtPriceX96 type: ${typeof state.sqrtPriceX96}, value: ${state.sqrtPriceX96}`);
+
+
+        const token0 = new ethers.Contract(immutables.token0, ERC20ABI, provider);
+        const token1 = new ethers.Contract(immutables.token1, ERC20ABI, provider);
+
+        // Fetch symbols and raw decimals
+        // Keep or remove debug logs as needed
+        // console.log(`DEBUG: Before fetching symbols/decimals for ${immutables.token0} and ${immutables.token1}`);
+        const [symbol0, symbol1, rawDecimals0, rawDecimals1] = await Promise.all([
+            token0.symbol(),
+            token1.symbol(),
+            token0.decimals(), // Returns BigInt in your env
+            token1.decimals()  // Returns BigInt in your env
+        ]);
+        // Keep or remove debug logs as needed
+        console.log(`DEBUG: rawDecimals0 type: ${typeof rawDecimals0}, value: ${rawDecimals0}`);
+        console.log(`DEBUG: rawDecimals1 type: ${typeof rawDecimals1}, value: ${rawDecimals1}`);
+
+
+        // Explicitly convert decimals to Number type if they came as BigInt
+        let decimals0 = (typeof rawDecimals0 === 'bigint') ? Number(rawDecimals0) : rawDecimals0;
+        let decimals1 = (typeof rawDecimals1 === 'bigint') ? Number(rawDecimals1) : rawDecimals1;
+
+        // Safeguard check after conversion
+        if (typeof decimals0 !== 'number' || !Number.isInteger(decimals0) || decimals0 < 0 ||
+            typeof decimals1 !== 'number' || !Number.isInteger(decimals1) || decimals1 < 0) {
+             console.warn(`Warning: Could not get valid number decimals for pool ${poolAddress}. Received raw types: ${typeof rawDecimals0}, ${typeof rawDecimals1}. Converted types: ${typeof decimals0}, ${typeof decimals1}`);
+             console.log(`⚠️ Skipped pool ${poolAddress} (${symbol0}-${symbol1}) due to invalid decimal types/values.`);
+             return; // Skip if conversion failed or values were unexpected
+        }
+
+        // Keep or remove debug logs as needed
+        // console.log(`DEBUG: Processed decimals0 type: ${typeof decimals0}, value: ${decimals0}`);
+        // console.log(`DEBUG: Processed decimals1 type: ${typeof decimals1}, value: ${decimals1}`);
+
+
+        // Check for extreme decimal differences using the now-number values
+        if (Math.abs(decimals0 - decimals1) > 18) {
+             console.log(`⚠️ Skipped pool ${poolAddress} (${symbol0}-${symbol1}) due to significant decimal difference (${decimals0}-${decimals1})`);
+             return; // Skip registration
+        }
+
+
+        // Price calculation now returns Decimal
+        // Keep or remove debug logs as needed
+        // console.log(`DEBUG: Calling getPriceFromSqrtPrice with sqrtPriceX96 type ${typeof state.sqrtPriceX96}, dec0=${decimals0}, dec1=${decimals1}`);
+        const price = getPriceFromSqrtPrice(state.sqrtPriceX96, decimals0, decimals1); // Pass number decimals here
+        // Keep or remove debug logs as needed
+        // console.log(`DEBUG: Calculated price type: ${typeof price}, value: ${price}`);
+
+
+        const pairKey = formatTokenPair(immutables.token0, immutables.token1);
+        if (!tokenPairMap.has(pairKey)) tokenPairMap.set(pairKey, []);
+         // Only add to map if not already present (shouldn't happen with unique addresses, but good practice)
+        if (!tokenPairMap.get(pairKey).includes(poolAddress)) {
+             tokenPairMap.get(pairKey).push(poolAddress);
+        }
+
+
+        allPools.set(poolAddress, {
+            token0: immutables.token0,
+            token1: immutables.token1,
+            token0Symbol: symbol0,
+            token1Symbol: symbol1,
+            token0Decimals: decimals0, // Store as number
+            token1Decimals: decimals1, // Store as number
+            fee: immutables.fee.toString(),
+            price: price, // Storing Decimal price
+            pairKey
+        });
+
+        // Keep or remove debug logs as needed
+        // console.log(`DEBUG: Preparing final log for pool ${poolAddress}, calling formatPrice with type ${typeof price}`);
+        console.log(`✅ Registered pool ${poolAddress} for ${symbol0}-${symbol1} @ ${immutables.fee.toString()}bps | Price: ${formatPrice(price)} (${symbol1}/${symbol0})`);
+    } catch (err) {
+        // DEBUG LOG 8: Log the error more verbosely
+        console.error(`❌ Error registering pool ${poolAddress}:`, err); // Log the full error object
+    }
+}
+
+async function listenToSwaps(poolAddress) {
+    // Check if the pool is still in our map before attempting to listen
+    if (!allPools.has(poolAddress)) {
+        // console.log(`ℹ️ Skipping listener for unregistered pool ${poolAddress}.`); // Uncomment if you want to see ignored pools
+        return;
+    }
+    const pool = allPools.get(poolAddress); // Get pool data which includes decimals
+
+    const poolContract = new ethers.Contract(poolAddress, IUniswapV3PoolABI, provider);
+
+    // Define the swap event topic to listen for
+    const swapEventTopic = ethers.id("Swap(address,address,int256,int256,uint160,uint128,int24)");
+
+    // Filter for the specific pool address and the Swap event topic
+    const filter = {
+        address: poolAddress,
+        topics: [
+            swapEventTopic
+        ]
+    };
+
+    // Listen using the provider directly for more robust event handling,
+    // especially with rate-limited RPCs. Ethers.js contract.on uses filters internally.
+    // Using contract.on is generally fine and simpler if the provider supports subscriptions.
+    poolContract.on('Swap', async (sender, recipient, amount0, amount1, sqrtPriceX96, liquidity, tick, event) => {
+         // Check if the pool is still in our map (should be, but safeguard)
+         if (!allPools.has(poolAddress)) {
+             console.log(`ℹ️ Received swap event for unregistered pool ${poolAddress}, ignoring.`);
+             return;
+         }
+
+        // Get the latest state directly if event data doesn't have sqrtPriceX96 accurately (Uniswap event does)
+        // const state = await getPoolState(poolContract); // Or use event data if reliable
+
+        const poolData = allPools.get(poolAddress); // Get current pool data including old price
+
+        // Recalculate price using the sqrtPriceX96 from the event and stored decimals
+        const newPrice = getPriceFromSqrtPrice(sqrtPriceX96, poolData.token0Decimals, poolData.token1Decimals);
+        poolData.price = newPrice; // Update the stored Decimal price
+
+        console.log(`\n🔁 Swap on ${poolData.token0Symbol}-${poolData.token1Symbol} @ Fee ${poolData.fee}: New Price = ${formatPrice(newPrice)} (${poolData.token1Symbol}/${poolData.token0Symbol})`);
+
+         // Only compare if there's more than one pool for the pair
+         const poolsForPair = tokenPairMap.get(poolData.pairKey);
+         if (poolsForPair && poolsForPair.length > 1) {
+             await comparePools(poolData.pairKey);
+         } // else console.log(`ℹ️ Only one pool registered for ${pool.pairKey}, skipping comparison.`); // Uncomment if you want to see skipped comparisons
+
+         // Optional: Process event details (amount0, amount1) if needed for detailed logging
+         // console.log(`  Swap Details: amount0=${amount0.toString()}, amount1=${amount1.toString()}, tick=${tick}`);
+
+    });
+
+     console.log(`👂 Started listening for swaps on pool ${poolAddress} (${pool.token0Symbol}-${pool.token1Symbol})`);
+}
+
+async function comparePools(pairKey) {
+    const poolAddresses = tokenPairMap.get(pairKey);
+    // Ensure there are at least two registered pools for this pair
+    if (!poolAddresses || poolAddresses.length < 2) {
+        // This case should ideally be caught by the caller, but safeguarding
+        // console.log(`ℹ️ Less than 2 registered pools for ${pairKey}, skipping comparison.`);
+        return;
+    }
+
+    // Filter out potentially undefined pools if some failed registration
+    const pools = poolAddresses.map(addr => allPools.get(addr)).filter(pool => pool !== undefined);
+
+    if (pools.length < 2) {
+        console.log(`ℹ️ Less than 2 active pools for ${pairKey} after filtering, skipping comparison.`);
+        return;
+    }
+
+
+    // Sort pools based on Decimal price using Decimal.cmp
+    pools.sort((a, b) => a.price.cmp(b.price));
+
+    const cheapest = pools[0];
+    const mostExpensive = pools[pools.length - 1];
+
+    // Calculate spread using Decimal arithmetic
+    // Avoid division by zero if cheapest price is 0 (shouldn't happen with valid pools but good practice)
+    let spread = new Decimal(0);
+    if (cheapest.price.gt(0)) {
+        spread = mostExpensive.price.minus(cheapest.price).div(cheapest.price).mul(100);
+    }
+
+
+    console.log(`📊 Price Spread for ${cheapest.token0Symbol}-${cheapest.token1Symbol}:`);
+    pools.forEach(p => {
+        console.log(`  ▪ ${p.fee} bps Pool: Price = ${formatPrice(p.price)} (${p.token1Symbol}/${p.token0Symbol})`);
+    });
+    console.log(`  ➤ % Spread: ${spread.toFixed(3)}%\n`); // Format spread
+
+    // Simulate arbitrage only if one of the tokens is USDC (which should be true for these pools now)
+    if (
+        cheapest.token0.toLowerCase() === USDC_ADDRESS.toLowerCase() ||
+        cheapest.token1.toLowerCase() === USDC_ADDRESS.toLowerCase()
+    ) {
+        simulateArbitrage(cheapest, mostExpensive);
+    }
+}
+
+function simulateArbitrage(cheapPool, expensivePool) {
+    // Assuming 200 USDC input
+    const inputAmountUSDC = new Decimal(200);
+    const usdcDecimals = 6; // USDC has 6 decimals
+
+    // Check if USDC is actually in both pools involved in the spread comparison
+    const cheapestInvolvesUSDC = cheapPool.token0.toLowerCase() === USDC_ADDRESS.toLowerCase() || cheapPool.token1.toLowerCase() === USDC_ADDRESS.toLowerCase();
+    const expensiveInvolvesUSDC = expensivePool.token0.toLowerCase() === USDC_ADDRESS.toLowerCase() || expensivePool.token1.toLowerCase() === USDC_ADDRESS.toLowerCase();
+
+     // This check is mostly redundant now as we only register USDC pools, but keeping for safety
+    if (!cheapestInvolvesUSDC || !expensiveInvolvesUSDC) {
+         // console.log("⚠️ USDC not found in both pools for arbitrage simulation.");
+         return;
+    }
+
+
+    const usdcIsToken0InCheap = cheapPool.token0.toLowerCase() === USDC_ADDRESS.toLowerCase();
+    const usdcIsToken0InExpensive = expensivePool.token0.toLowerCase() === USDC_ADDRESS.toLowerCase();
+
+    // Prices are Token1 per Token0 (adjusted for decimals)
+    const priceCheap_T1_per_T0 = cheapPool.price; // This is already a Decimal
+    const priceExp_T1_per_T0 = expensivePool.price; // This is already a Decimal
+
+    let amountOtherToken; // Amount of the non-USDC token received in the first swap
+    let amountUSDCBack; // Amount of USDC received in the second swap
+
+    // Simulate Swap 1: Start with USDC in the cheap pool
+    if (usdcIsToken0InCheap) {
+        // Input USDC (Token0), get Token1
+        amountOtherToken = inputAmountUSDC.mul(priceCheap_T1_per_T0); // amount T1 = amount T0 * Price(T1/T0)
+         console.log(`  Swap 1 Direction: ${cheapPool.token0Symbol} (${cheapPool.token0Decimals}d) -> ${cheapPool.token1Symbol} (${cheapPool.token1Decimals}d)`);
+    } else {
+        // Input USDC (Token1), get Token0
+        // Need price T0/T1 = 1 / Price(T1/T0)
+        const priceCheap_T0_per_T1 = (new Decimal(1)).div(priceCheap_T1_per_T0);
+        amountOtherToken = inputAmountUSDC.mul(priceCheap_T0_per_T1); // amount T0 = amount T1 * Price(T0/T1)
+        console.log(`  Swap 1 Direction: ${cheapPool.token1Symbol} (${cheapPool.token1Decimals}d) -> ${cheapPool.token0Symbol} (${cheapPool.token0Decimals}d)`);
+    }
+
+    // Determine the other token for the second swap based on the expensive pool's token order
+    const otherTokenSymbolExpensive = usdcIsToken0InExpensive ? expensivePool.token1Symbol : expensivePool.token0Symbol;
+    const otherTokenDecimalsExpensive = usdcIsToken0InExpensive ? expensivePool.token1Decimals : expensivePool.token0Decimals;
+     // Check if the other token matches between the two pools for a direct swap
+     // This simplified arbitrage assumes the non-USDC token is the same in both pools.
+     const otherTokenAddressCheap = usdcIsToken0InCheap ? cheapPool.token1.toLowerCase() : cheapPool.token0.toLowerCase();
+     const otherTokenAddressExpensive = usdcIsToken0InExpensive ? expensivePool.token1.toLowerCase() : expensivePool.token0.toLowerCase();
+
+      // This check is also largely redundant now, but good practice if data sources differ
+     if (otherTokenAddressCheap !== otherTokenAddressExpensive) {
+         console.log(`⚠️ Non-USDC token mismatch between pools (${cheapPool.token0Symbol}-${cheapPool.token1Symbol} vs ${expensivePool.token0Symbol}-${expensivePool.token1Symbol}), skipping arbitrage simulation.`);
+         return;
+     }
+    const otherTokenSymbol = otherTokenSymbolExpensive; // Use the symbol from the expensive pool for display
+    const otherTokenDecimals = otherTokenDecimalsExpensive; // Use decimals from the expensive pool
+
+
+    // Simulate Swap 2: Swap the OtherToken amount in the expensive pool back to USDC
+    if (usdcIsToken0InExpensive) {
+        // Input OtherToken (which is Token1 in this pool), get Token0 (USDC)
+        // Need price T0/T1 = 1 / Price(T1/T0)
+        const priceExp_T0_per_T1 = (new Decimal(1)).div(priceExp_T1_per_T0); // Use new Decimal(1)
+         // amount T0 = amount T1 * Price(T0/T1)
+        amountUSDCBack = amountOtherToken.mul(priceExp_T0_per_T1);
+        console.log(`  Swap 2 Direction: ${expensivePool.token1Symbol} (${expensivePool.token1Decimals}d) -> ${expensivePool.token0Symbol} (${expensivePool.token0Decimals}d)`);
+    } else {
+        // Input OtherToken (which is Token0 in this pool), get Token1 (USDC)
+        // Price is T1/T0
+        // amount T1 = amount T0 * Price(T1/T0)
+        amountUSDCBack = amountOtherToken.mul(priceExp_T1_per_T0);
+         console.log(`  Swap 2 Direction: ${expensivePool.token0Symbol} (${expensivePool.token0Decimals}d) -> ${expensivePool.token1Symbol} (${expensivePool.token1Decimals}d)`);
+    }
+
+
+    const profit = amountUSDCBack.minus(inputAmountUSDC);
+
+
+    if (profit.gt(0)) {
+        console.log(`💰 Arbitrage Opportunity!`);
+        console.log(`  Input: ${inputAmountUSDC.toFixed(usdcDecimals)} USDC`);
+        console.log(`  Pools: Cheap @ ${cheapPool.fee}bps (${cheapPool.token0Symbol}-${cheapPool.token1Symbol}) | Expensive @ ${expensivePool.fee}bps (${expensivePool.token0Symbol}-${expensivePool.token1Symbol})`);
+        console.log(`  Intermediate Output: ~${amountOtherToken.toFixed(otherTokenDecimals)} ${otherTokenSymbol}`);
+        console.log(`  Final Output: ~${amountUSDCBack.toFixed(usdcDecimals)} USDC`);
+        console.log(`  Estimated Profit: ${profit.toFixed(usdcDecimals)} USDC\n`);
+    } else {
+        // console.log(`⚠️ No profitable arbitrage opportunity found on this swap\n`); // Can be noisy, uncomment if needed
+    }
+}
+
+// getPoolImmutables is fine, returns BigInt for fee, converted to string.
+async function getPoolImmutables(poolContract) {
+    const token0 = await poolContract.token0();
+    const token1 = await poolContract.token1();
+    const fee = await poolContract.fee(); // fee is BigInt in ethers v6
+    return { token0, token1, fee: fee.toString() }; // Convert fee to string for storage
+}
+
+// getPoolState is fine, returns BigInts for slot0 values
+async function getPoolState(poolContract) {
+    // slot0 returns an array where [0] is sqrtPriceX96 (BigInt) and [1] is liquidity (BigInt)
+    const slot0 = await poolContract.slot0();
+    return {
+        // Keep sqrtPriceX96 as BigInt, it's the input type for the corrected getPriceFromSqrtPrice
+        sqrtPriceX96: slot0[0],
+        liquidity: slot0[1].toString() // Convert liquidity to string if needed later
+    };
+}
+
+// getTokenDecimals - returns number in ethers v6 ideally, but handling potential BigInt return
+async function getTokenDecimals(tokenAddress) {
+    try {
+        const tokenContract = new ethers.Contract(tokenAddress, ERC20ABI, provider);
+        // Ethers v6 should return number for decimals (uint8)
+        const decimals = await tokenContract.decimals();
+         if (typeof decimals === 'number' && Number.isInteger(decimals) && decimals >= 0) {
+             return decimals; // Return number if it's a valid number
+         } else if (typeof decimals === 'bigint') {
+             // If it's a bigint, try to convert to number. Decimals should fit.
+             const numDecimals = Number(decimals);
+             if (Number.isInteger(numDecimals) && numDecimals >= 0) {
+                  console.warn(`Warning: Decimals for ${tokenAddress} returned as bigint, converted to number: ${numDecimals}`);
+                  return numDecimals;
+             }
+         }
+         // If not a valid number or convertible bigint
+         console.warn(`getTokenDecimals for ${tokenAddress} returned unexpected type/value:`, decimals);
+         return null; // Indicate failure
+    } catch (error) {
+        console.error(`Error getting decimals for ${tokenAddress}:`, error.message);
+        return null;
+    }
+}
+
+
+// The Graph query function updated to query for pools involving USDC, sorted by TVL
+async function getPoolsFromGraph() {
+     if (GRAPH_API_KEY === 'YOUR_GRAPH_API_KEY') {
+         console.error("ERROR: GRAPH_API_KEY is not set. Please replace 'YOUR_GRAPH_API_KEY' in the code with your actual key.");
+         return []; // Prevent execution without a key
+     }
+
+    const subgraphId = '5zvR82QoaXYFyDEKLZ9t6v9adgnptxYpKpSbxtgVENFV'; // Uniswap V3 Mainnet subgraph
+    const queryUrl = `https://gateway.thegraph.com/api/${GRAPH_API_KEY}/subgraphs/id/${subgraphId}`;
+
+    const usdcAddressLower = USDC_ADDRESS.toLowerCase();
+    const poolsLimit = 100; // Maximum pools to fetch for each token position query
+
+    // Query 1: Pools where token0 is USDC, top by TVL
+    const queryToken0IsUSDC = `
+        {
+            pools(
+                first: ${poolsLimit},
+                orderBy: totalValueLockedUSD,
+                orderDirection: desc,
+                where: { token0: "${usdcAddressLower}" }
+            ) {
+                id
+                token0 { id symbol }
+                token1 { id symbol }
+                feeTier
+                 totalValueLockedUSD # Include TVL for potential future sorting or logging
+            }
+        }
+    `;
+
+    // Query 2: Pools where token1 is USDC, top by TVL
+    const queryToken1IsUSDC = `
+        {
+            pools(
+                first: ${poolsLimit},
+                orderBy: totalValueLockedUSD,
+                orderDirection: desc,
+                where: { token1: "${usdcAddressLower}" }
+            ) {
+                id
+                token0 { id symbol }
+                token1 { id symbol }
+                feeTier
+                 totalValueLockedUSD # Include TVL
+            }
+        }
+    `;
+
+    let pools = [];
+    const fetchedPoolIds = new Set(); // Use a Set to track unique pool IDs across queries
+
+    try {
+        // Execute Query 1
+        console.log(`Workspaceing top ${poolsLimit} pools from Graph where token0 is USDC by TVL...`);
+        const response0 = await fetch(queryUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: queryToken0IsUSDC })
+        });
+        if (!response0.ok) {
+             const errorBody = await response0.text();
+             throw new Error(`Graph query (token0 is USDC) failed with status ${response0.status}: ${errorBody}`);
+        }
+        const data0 = await response0.json();
+        const pools0 = data0?.data?.pools || [];
+        console.log(`Workspaceed ${pools0.length} pools where token0 is USDC.`);
+
+
+        // Add pools from Query 1, ensuring uniqueness by ID
+        pools0.forEach(pool => {
+             if (!fetchedPoolIds.has(pool.id)) {
+                 pools.push({
+                     id: pool.id,
+                     token0: pool.token0.id,
+                     token1: pool.token1.id,
+                     feeTier: pool.feeTier,
+                     // You can optionally store totalValueLockedUSD here if needed later
+                     // tvlUSD: pool.totalValueLockedUSD
+                 });
+                 fetchedPoolIds.add(pool.id);
+             }
+        });
+
+        // Add a small delay between Graph calls to avoid rate limits there too
+         await new Promise(resolve => setTimeout(resolve, 500)); // 500ms delay between Graph queries
+
+
+        // Execute Query 2
+        console.log(`Workspaceing top ${poolsLimit} pools from Graph where token1 is USDC by TVL...`);
+        const response1 = await fetch(queryUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: queryToken1IsUSDC })
+        });
+        if (!response1.ok) {
+             const errorBody = await response1.text();
+             throw new Error(`Graph query (token1 is USDC) failed with status ${response1.status}: ${errorBody}`);
+        }
+        const data1 = await response1.json();
+        const pools1 = data1?.data?.pools || [];
+        console.log(`Workspaceed ${pools1.length} pools where token1 is USDC.`);
+
+        // Add pools from Query 2, ensuring uniqueness by ID
+        pools1.forEach(pool => {
+             if (!fetchedPoolIds.has(pool.id)) {
+                 pools.push({
+                     id: pool.id,
+                     token0: pool.token0.id,
+                     token1: pool.token1.id,
+                     feeTier: pool.feeTier,
+                     // tvlUSD: pool.totalValueLockedUSD
+                 });
+                 fetchedPoolIds.add(pool.id);
+             }
+        });
+
+        // The 'pools' array now contains unique pools involving USDC,
+        // consisting of the top 100 where USDC is token0 and the top 100 where USDC is token1,
+        // both sorted by TVL within their respective groups.
+        // For a strictly global sort of the combined list by TVL, you would need to
+        // sort the 'pools' array here based on the 'tvlUSD' you could store.
+        // Keeping it simple for now as requested ("without changing anything else").
+
+        console.log(`Total unique pools involving USDC fetched from Graph: ${pools.length}`);
+        return pools;
+
+    } catch (error) {
+        console.error('Error fetching data from The Graph:', error.message);
+        return [];
+    }
+}
+
+// ✅ Start the bot
+(async () => {
+     console.log("Starting bot...");
+     // Check provider connection
+     try {
+        await provider.getBlockNumber();
+        console.log("✅ Provider connected successfully.");
+     } catch (e) {
+        console.error("❌ Failed to connect to provider:", e.message);
+        console.error("Please check your Infura Project ID and network connection.");
+        process.exit(1); // Exit if cannot connect
+     }
+
+
+    const poolsFromGraph = await getPoolsFromGraph();
+    console.log(`✅ Fetched ${poolsFromGraph.length} unique pools involving USDC from The Graph.`); // Updated log message
+
+    if (poolsFromGraph.length === 0) {
+         console.log("No pools involving USDC fetched from The Graph. Check Graph query or USDC address.");
+         console.log("Ensure your Graph API key is correct and the subgraph is healthy.");
+         return; // Exit if no pools are found
+    }
+
+    console.log("--- Registering Pools ---");
+    // Delay set to 60000 milliseconds (1 minute)
+    const processDelay = 60000; // 1 minute delay between processing each pool
+
+
+    for (const pool of poolsFromGraph) {
+        // The filtering logic based on USDC is REMOVED from here
+        // because getPoolsFromGraph now fetches only pools involving USDC
+        // The check for invalid decimals remains inside registerPool
+
+        console.log(`➡️ Processing pool: ${pool.id} (Fee Tier: ${pool.feeTier} bps)`);
+
+        const immutables = {
+            token0: pool.token0,
+            token1: pool.token1,
+            fee: BigInt(pool.feeTier)
+        };
+
+        // registerPool will now fetch details and register this USDC pool
+        await registerPool(pool.id, immutables);
+
+        // Add the specified delay after processing each pool
+        console.log(`Waiting ${processDelay / 1000} seconds before processing next pool...`);
+        await new Promise(resolve => setTimeout(resolve, processDelay));
+    }
+    // The number of registered pools will be `allPools.size`
+    console.log(`--- Finished Registering Pools --- Registered ${allPools.size} pools.`);
+
+
+    console.log("🏁 Finished processing initial pools. Starting swap listeners...");
+
+    // Start listeners *after* all initial pools are registered
+    // Only listen to pools that were successfully registered and added to allPools (which are now only USDC pools)
+     const registeredPoolAddresses = Array.from(allPools.keys());
+    if (registeredPoolAddresses.length > 0) {
+         for (const poolAddress of registeredPoolAddresses) {
+             await listenToSwaps(poolAddress);
+         }
+         console.log(` Listening for swaps on ${allPools.size} registered pools...`);
+    } else {
+         console.log(" No pools were successfully registered. No swap listeners started.");
+    }
+
+
+     // The script will now stay alive listening for events.
+     // Will add shutdown
+})();
