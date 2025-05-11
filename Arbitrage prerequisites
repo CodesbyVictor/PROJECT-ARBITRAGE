@@ -1,1 +1,5 @@
-Ensure you have installed the following(hardhat on vs code):
+Ensure you have installed the following(on vs code):
+ethers: ethers version 6. : install using npm install ethers.
+node-fetch: To make HTTP requests.:or high-precision decimal arithmetic.
+install using npm install node-fetch.
+decimal.js: (for high-precision decimal arithmetic) install using npm install decimal.js.
