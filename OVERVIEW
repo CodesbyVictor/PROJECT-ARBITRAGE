@@ -1,0 +1,61 @@
+Dependencies and Setup:
+
+Imports necessary libraries: ethers for interacting with Ethereum, fetch for making HTTP requests, and Decimal.js for precise decimal arithmetic.
+Imports ABIs for Uniswap V3 pool and ERC20 contracts.
+Configures an Ethereum provider using Infura.
+Defines the USDC address and pre-calculates constants for efficiency.
+Initializes global data structures: allPools to store pool information and tokenPairMap to map token pairs to pool addresses.
+
+Helper Functions:
+
+formatTokenPair(): Generates a unique key for a token pair by sorting and joining their addresses.
+formatPrice(): Formats a Decimal price to a human-readable string with 10 decimal places.
+getPriceFromSqrtPrice(): Calculates the price of Token1 per Token0 from the Uniswap V3 pool's sqrtPriceX96 value, accounting for token decimals and using Decimal.js for accurate calculations.
+Pool Management Functions:
+
+registerPool():
+Takes a pool address and immutable data (token addresses, fee).
+Creates contracts for the pool and its tokens.
+Fetches token symbols and decimals.
+Gets the pool's current state (price).
+Stores the pool's information in the allPools map.
+Logs the successful registration of the pool.
+listenToSwaps():
+Takes a pool address.
+Creates a contract for the pool.
+Sets up a listener for 'Swap' events on the pool.
+When a swap occurs:
+Recalculates the price using getPriceFromSqrtPrice().
+Updates the pool's price in allPools.
+Logs the swap and the new price.
+Calls comparePools() if there are multiple pools for the token pair.
+Arbitrage Functions:
+
+comparePools():
+Takes a token pair.
+Retrieves all pool addresses for that pair.
+Compares prices across the pools.
+Calculates the price spread.
+Logs the price spread.
+Calls simulateArbitrage() if an arbitrage opportunity with USDC is detected.
+simulateArbitrage():
+Simulates an arbitrage trade between the cheapest and most expensive pools, using a fixed input amount of USDC.
+Calculates the amount of the other token obtained in the first swap and the amount of USDC obtained in the second swap.
+Calculates the profit.
+Logs the trade details and profit if an arbitrage opportunity is found.
+Data Fetching Functions
+
+getPoolImmutables(): Fetches immutable pool data (token addresses, fee) from the pool contract.
+getPoolState(): Fetches the current pool state (sqrtPriceX96, liquidity) from the pool contract.
+getTokenDecimals(): Fetches the decimal count of a given token.
+getPoolsFromGraph():
+Fetches Uniswap V3 pools involving USDC from The Graph, sorted by TVL.
+It queries for pools where USDC is token0 and where USDC is token1, and combines the results, ensuring uniqueness.
+This function now specifically targets pools with USDC, improving efficiency.
+Main Execution Block:
+
+Checks the provider connection.
+Fetches pools involving USDC from The Graph using getPoolsFromGraph().
+Registers each pool using registerPool(), with a delay between each registration.
+Starts listening for swap events on the registered pools using listenToSwaps().
+The script then continues to listen for swap events, performing arbitrage checks when necessary.
